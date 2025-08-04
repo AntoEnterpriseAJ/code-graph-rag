@@ -14,3 +14,7 @@ wheels/
 .mypy_cache/
 .pytest_cache/
 .claude/
+
+toy_repo/
+.vscode
+grammars/tree-sitter-cpp/

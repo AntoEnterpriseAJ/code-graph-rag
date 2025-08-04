@@ -95,6 +95,12 @@ MATCH (n)
 WHERE toLower(n.name) CONTAINS 'database' OR (n.qualified_name IS NOT NULL AND toLower(n.qualified_name) CONTAINS 'database')
 RETURN n.name AS name, n.qualified_name AS qualified_name, labels(n) AS type
 
+**Pattern: C++-style `Class::method` lookup**
+cypher// "show me AnotherClass::doubleValue"
+MATCH (m:Method)
+WHERE m.qualified_name ENDS WITH '.AnotherClass.doubleValue'
+RETURN m.name AS name, m.qualified_name AS qualified_name, labels(m) AS type
+
 **Pattern: Finding a Specific File**
 cypher// "Find the main README.md"
 MATCH (f:File) WHERE toLower(f.name) = 'readme.md' AND f.path = 'README.md'

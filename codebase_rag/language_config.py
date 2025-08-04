@@ -148,8 +148,14 @@ LANGUAGE_CONFIGS = {
     ),
     "cpp": LanguageConfig(
         name="cpp",
-        file_extensions=[".cpp", ".h", ".hpp", ".cc", ".cxx", ".hxx", ".hh"],
-        function_node_types=["function_definition"],
+        file_extensions=[".cc", ".cpp", ".cxx", ".hpp", ".hxx", ".h"],
+        # 1️⃣ capture definitions, not just declarators
+        function_node_types=[
+            "function_definition",  # <-- add this!
+            "function_declarator",  # out-of-class declarations
+            "lambda_expression",
+        ],
+        # keep class specifiers only (remove primitive types etc. that create noise)
         class_node_types=[
             "class_specifier",
             "struct_specifier",
@@ -159,7 +165,8 @@ LANGUAGE_CONFIGS = {
         module_node_types=["translation_unit", "namespace_definition"],
         call_node_types=["call_expression"],
         import_node_types=["preproc_include"],
-        import_from_node_types=["preproc_include"],  # C++ uses #include
+        import_from_node_types=["preproc_include"],
+        package_indicators=[],
     ),
     "c-sharp": LanguageConfig(
         name="c-sharp",

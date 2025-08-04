@@ -19,10 +19,17 @@ class CodeRetriever:
         """Finds a code snippet by querying the graph for its location."""
         logger.info(f"[CodeRetriever] Searching for: {qualified_name}")
 
+        # One hop is enough: Module ─DEFINES/DEFINES_METHOD→ (n)
         query = """
-            MATCH (n) WHERE n.qualified_name = $qn
-            OPTIONAL MATCH (m:Module)-[*]-(n)
-            RETURN n.name AS name, n.start_line AS start, n.end_line AS end, m.path AS path, n.docstring AS docstring
+            MATCH (n {qualified_name:$qn})
+            OPTIONAL MATCH (n)<-[:DEFINES|DEFINES_METHOD]-(m:Module)
+            WITH n,
+                 coalesce(n.impl_path , m.path) AS path
+            RETURN n.name        AS name,
+                   n.start_line  AS start,
+                   n.end_line    AS end,
+                   path,
+                   n.docstring   AS docstring
             LIMIT 1
         """
         params = {"qn": qualified_name}
@@ -42,7 +49,7 @@ class CodeRetriever:
                 )
 
             res = results[0]
-            file_path_str = res.get("path")
+            file_path_str = res.get("impl_path") or res.get("path")
             start_line = res.get("start")
             end_line = res.get("end")
 

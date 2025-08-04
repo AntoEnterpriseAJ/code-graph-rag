@@ -104,8 +104,13 @@ class DefinitionProcessor:
             )
 
             self.import_processor.parse_imports(root_node, module_qn, language, queries)
-            self._ingest_all_functions(root_node, module_qn, language, queries)
-            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
+            # pass relative_path_str down so we can save it as impl_path
+            self._ingest_all_functions(
+                root_node, module_qn, language, queries, relative_path_str
+            )
+            self._ingest_classes_and_methods(
+                root_node, module_qn, language, queries, relative_path_str
+            )
 
             return root_node, language
 
@@ -202,8 +207,112 @@ class DefinitionProcessor:
                             return func_attr_name
         return None
 
+    def _handle_cpp_out_of_class_method(
+        self, func_node: Node, module_qn: str, file_path: str
+    ) -> bool:
+        """
+        Catches C++ definitions of the form  MyClass::method(...) { … }
+        that live at file scope and registers them as Class + Method
+        instead of as a free Function.  Returns True when it handled the node.
+        """
+        # Ignore bare declarations like `A::foo(int);`
+        if not self._cpp_has_body(func_node):
+            return False
+        declarator = func_node.child_by_field_name("declarator")
+        while declarator and declarator.type == "function_declarator":
+            declarator = declarator.child_by_field_name("declarator")
+
+        if not (declarator and declarator.type == "qualified_identifier"):
+            return False
+
+        scope_node = declarator.child_by_field_name("scope")
+        name_node = declarator.child_by_field_name("name")
+        if not (scope_node and name_node):
+            return False
+
+        class_name = scope_node.text.decode("utf8")  # MyClass
+        method_name = name_node.text.decode("utf8")  # doubleValue …
+
+        class_qn = f"{module_qn}.{class_name}"
+        method_qn = f"{class_qn}.{method_name}"
+
+        self.ingestor.ensure_node_batch(
+            "Class",
+            {"qualified_name": class_qn, "name": class_name},
+        )
+
+        self.ingestor.ensure_node_batch(
+            "Method",
+            {
+                "qualified_name": method_qn,
+                "name": method_name,
+                "impl_path": file_path,
+                "start_line": func_node.start_point[0] + 1,
+                "end_line": func_node.end_point[0] + 1,
+            },
+        )
+        self.function_registry[method_qn] = "Method"
+        self.simple_name_lookup[method_name].add(method_qn)
+
+        self.ingestor.ensure_relationship_batch(
+            ("Class", "qualified_name", class_qn),
+            "DEFINES_METHOD",
+            ("Method", "qualified_name", method_qn),
+        )
+
+        # ── NEW edge:   *.cpp module* → method ─────────────────────
+        #     This lets CodeRetriever pick up the correct file path.
+        self.ingestor.ensure_relationship_batch(
+            ("Module", "qualified_name", module_qn),  # ← current .cpp file
+            "DEFINES_METHOD",  # name can stay the same
+            ("Method", "qualified_name", method_qn),
+        )
+        return True
+
+    def _cpp_unwind_to_core_declarator(self, node: Node) -> Node | None:
+        """
+        For C++ `function_definition` or `function_declarator`, drill down
+        through nested `function_declarator` layers until we reach the
+        core declarator (identifier | field_identifier | qualified_identifier).
+        """
+        cur = node
+        if cur.type == "function_definition":
+            cur = cur.child_by_field_name("declarator") or cur
+        while cur and cur.type == "function_declarator":
+            nxt = cur.child_by_field_name("declarator")
+            if not nxt:
+                break
+            cur = nxt
+        return cur
+
+    def _cpp_extract_name(self, node: Node) -> Any:
+        """
+        Return the *simple* name for a C++ function/method declarator
+        (`foo`, not `A::foo`).  Works for both file-scope functions and
+        in-class inline methods.
+        """
+        core = self._cpp_unwind_to_core_declarator(node)
+        if not core:
+            return None
+        if core.type in ("identifier", "field_identifier"):
+            return core.text.decode("utf8")
+        if core.type == "qualified_identifier":
+            name_node = core.child_by_field_name("name")
+            if name_node:
+                return name_node.text.decode("utf8")
+        return None
+
+    def _cpp_has_body(self, func: Node) -> bool:
+        """True if a C++ function / method really has an implementation body."""
+        return func.child_by_field_name("body") is not None
+
     def _ingest_all_functions(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: str,
     ) -> None:
         """Extract and ingest all functions (including nested ones)."""
         lang_queries = queries[language]
@@ -216,6 +325,51 @@ class DefinitionProcessor:
         func_nodes = captures.get("function", [])
 
         for func_node in func_nodes:
+            # ── C++: skip bare declarations (they are `function_declarator`s)
+            if language == "cpp" and func_node.type != "function_definition":
+                continue
+            # ────────────────────────────────────────────────────────────────
+            # Fast-path for *file-scope* C++ functions (and lambdas captured
+            # as `function_definition`).  We already extracted the name; now
+            # add the Function node and skip the generic code below.
+            # ────────────────────────────────────────────────────────────────
+            if language == "cpp":
+                if not self._cpp_has_body(func_node):  # ← skip declarations
+                    continue
+                simple = self._cpp_extract_name(func_node)
+                if not simple:
+                    continue
+                # out-of-class definitions like  A::foo(...) { … }
+                if self._handle_cpp_out_of_class_method(
+                    func_node, module_qn, file_path
+                ):
+                    continue
+                # inline class methods are handled inside
+                # _ingest_classes_and_methods()
+                if self._is_method(func_node, lang_config):
+                    continue
+
+                func_qn = f"{module_qn}.{simple}"
+                self.ingestor.ensure_node_batch(
+                    "Function",
+                    {
+                        "qualified_name": func_qn,
+                        "name": simple,
+                        "impl_path": file_path,
+                        "start_line": func_node.start_point[0] + 1,
+                        "end_line": func_node.end_point[0] + 1,
+                    },
+                )
+                self.function_registry[func_qn] = "Function"
+                self.simple_name_lookup[simple].add(func_qn)
+
+                self.ingestor.ensure_relationship_batch(
+                    ("Module", "qualified_name", module_qn),
+                    "DEFINES",
+                    ("Function", "qualified_name", func_qn),
+                )
+                continue  # ✅  handled – move to next node
+
             if not isinstance(func_node, Node):
                 logger.warning(
                     f"Expected Node object but got {type(func_node)}: {func_node}"
@@ -266,11 +420,16 @@ class DefinitionProcessor:
             )
 
     def _ingest_top_level_functions(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: str,
     ) -> None:
         """Extract and ingest top-level functions. (Legacy method, replaced by _ingest_all_functions)"""
         # Keep for backward compatibility, but delegate to new method
-        self._ingest_all_functions(root_node, module_qn, language, queries)
+        self._ingest_all_functions(root_node, module_qn, language, queries, file_path)
 
     def _build_nested_qualified_name(
         self,
@@ -278,7 +437,7 @@ class DefinitionProcessor:
         module_qn: str,
         func_name: str,
         lang_config: LanguageConfig,
-    ) -> str | None:
+    ) -> Any:
         """Build qualified name for nested functions."""
         path_parts = []
         current = func_node.parent
@@ -345,7 +504,12 @@ class DefinitionProcessor:
         return "Module", module_qn
 
     def _ingest_classes_and_methods(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: str,
     ) -> None:
         """Extract and ingest classes and their methods."""
         lang_queries = queries[language]
@@ -409,21 +573,27 @@ class DefinitionProcessor:
             method_captures = method_cursor.captures(body_node)
             method_nodes = method_captures.get("function", [])
             for method_node in method_nodes:
-                if not isinstance(method_node, Node):
+                if language == "cpp" and not self._cpp_has_body(method_node):
                     continue
+
+                method_name = None
                 method_name_node = method_node.child_by_field_name("name")
-                if not method_name_node:
+                if method_name_node and method_name_node.text:
+                    method_name = method_name_node.text.decode("utf8")
+                elif language == "cpp":
+                    # C++ inline method: grab the name ourselves
+                    method_name = self._cpp_extract_name(method_node)
+
+                if not method_name:
                     continue
-                text = method_name_node.text
-                if text is None:
-                    continue
-                method_name = text.decode("utf8")
+
                 method_qn = f"{class_qn}.{method_name}"
                 decorators = self._extract_decorators(method_node)
                 method_props: dict[str, Any] = {
                     "qualified_name": method_qn,
                     "name": method_name,
                     "decorators": decorators,
+                    "impl_path": file_path,
                     "start_line": method_node.start_point[0] + 1,
                     "end_line": method_node.end_point[0] + 1,
                     "docstring": self._get_docstring(method_node),
