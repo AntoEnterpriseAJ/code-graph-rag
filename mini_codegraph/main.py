@@ -1,10 +1,10 @@
 from query import ask_graph, find_snippet, ingest_repo
 
-REPO = "/.../some_path/"
+REPO = "/home/anto/dev/repos/CT/AlgoPool.CT.CoronaryCommon"
 
 ingest_repo(REPO)
 
-rows = ask_graph("show Contourer::run")
+rows = ask_graph("show MeshUtils::cutMesh")
 qn = rows[0]["qualified_name"]
 
 snippet = find_snippet(qn, project_root=REPO)

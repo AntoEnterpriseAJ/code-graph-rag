@@ -3,10 +3,9 @@
 from pathlib import Path
 from typing import Any
 
+from ingestion.language_config import LanguageConfig
 from loguru import logger
 from tree_sitter import Node, QueryCursor
-
-from ..language_config import LanguageConfig
 
 
 class ImportProcessor:

@@ -1,174 +1,96 @@
-from typing import cast
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Literal, cast
 
 from config import detect_provider_from_model, settings
+from langchain.schema import AIMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_vertexai import ChatVertexAI
+from langchain_openai import ChatOpenAI
 from loguru import logger
 from nl2cypher.prompts import (
     CYPHER_SYSTEM_PROMPT,
     LOCAL_CYPHER_SYSTEM_PROMPT,
-    RAG_ORCHESTRATOR_SYSTEM_PROMPT,
 )
-from pydantic_ai import Agent, Tool
-from pydantic_ai.models.gemini import GeminiModel, GeminiModelSettings
-from pydantic_ai.models.openai import (
-    OpenAIModel,
-    OpenAIResponsesModel,
-)
-from pydantic_ai.providers.google_gla import GoogleGLAProvider
-from pydantic_ai.providers.google_vertex import GoogleVertexProvider, VertexAiRegion
-from pydantic_ai.providers.openai import OpenAIProvider
+
+Provider = Literal["openai", "gemini", "local"]
 
 
-class LLMGenerationError(Exception):
-    """Custom exception for LLM generation failures."""
-
-    pass
+class LLMGenerationError(RuntimeError):
+    """Raised when the underlying chat model fails or returns junk."""
 
 
-def _clean_cypher_response(response_text: str) -> str:
-    """Utility to clean up common LLM formatting artifacts from a Cypher query."""
-    query = response_text.strip().replace("`", "")
-    if query.startswith("cypher"):
-        query = query[6:].strip()
-    if not query.endswith(";"):
-        query += ";"
-    return query
+def _clean_cypher_response(raw: str) -> str:
+    txt = raw.strip().replace("`", "")
+    if txt.lower().startswith("cypher"):
+        txt = txt[6:].strip()
+    return txt if txt.endswith(";") else txt + ";"
+
+
+def _make_chat_model(model_id: str, *, provider: Provider) -> Any:
+    if provider == "openai":
+        return ChatOpenAI(
+            model=model_id,
+            api_key=settings.OPENAI_API_KEY,
+            streaming=False,
+        )
+    if provider == "local":
+        # OpenAI-compatible endpoint
+        return ChatOpenAI(
+            model=model_id,
+            api_key=settings.LOCAL_MODEL_API_KEY,
+            base_url=str(settings.LOCAL_MODEL_ENDPOINT),
+            streaming=False,
+        )
+    if provider == "gemini" and settings.GEMINI_PROVIDER == "vertex":
+        return ChatVertexAI(
+            model_name=model_id,
+            project=settings.GCP_PROJECT_ID,
+            location=settings.GCP_REGION,
+            credentials_path=settings.GCP_SERVICE_ACCOUNT_FILE,
+            convert_system_message_to_human=True,
+        )
+    if provider == "gemini":
+        return ChatGoogleGenerativeAI(
+            model=model_id,
+            google_api_key=settings.GEMINI_API_KEY,
+            safety_settings={"HARASSMENT": "BLOCK_NONE"},
+        )
+    raise ValueError(f"Unhandled provider: {provider}")
 
 
 class CypherGenerator:
-    """Generates Cypher queries from natural language."""
-
     def __init__(self) -> None:
-        try:
-            model_settings = None
-
-            # Get active cypher model and detect its provider
-            cypher_model_id = settings.active_cypher_model
-            cypher_provider = detect_provider_from_model(cypher_model_id)
-
-            # Configure model based on detected provider
-            if cypher_provider == "gemini":
-                if settings.GEMINI_PROVIDER == "vertex":
-                    provider = GoogleVertexProvider(
-                        project_id=settings.GCP_PROJECT_ID,
-                        region=cast(VertexAiRegion, settings.GCP_REGION),
-                        service_account_file=settings.GCP_SERVICE_ACCOUNT_FILE,
-                    )
-                else:
-                    provider = GoogleGLAProvider(api_key=settings.GEMINI_API_KEY)  # type: ignore
-
-                if settings.GEMINI_THINKING_BUDGET is not None:
-                    model_settings = GeminiModelSettings(
-                        gemini_thinking_config={
-                            "thinking_budget": int(settings.GEMINI_THINKING_BUDGET)
-                        }
-                    )
-
-                llm = GeminiModel(
-                    cypher_model_id,
-                    provider=provider,
-                )
-                system_prompt = CYPHER_SYSTEM_PROMPT
-            elif cypher_provider == "openai":
-                llm = OpenAIResponsesModel(
-                    cypher_model_id,
-                    provider=OpenAIProvider(
-                        api_key=settings.OPENAI_API_KEY,
-                    ),
-                )
-                system_prompt = CYPHER_SYSTEM_PROMPT
-            else:  # local
-                llm = OpenAIModel(  # type: ignore
-                    cypher_model_id,
-                    provider=OpenAIProvider(
-                        api_key=settings.LOCAL_MODEL_API_KEY,
-                        base_url=str(settings.LOCAL_MODEL_ENDPOINT),
-                    ),
-                )
-                system_prompt = LOCAL_CYPHER_SYSTEM_PROMPT
-            self.agent = Agent(
-                model=llm,
-                system_prompt=system_prompt,
-                output_type=str,
-                model_settings=model_settings,
-            )
-        except Exception as e:
-            raise LLMGenerationError(
-                f"Failed to initialize CypherGenerator: {e}"
-            ) from e
-
-    async def generate(self, natural_language_query: str) -> str:
-        logger.info(
-            f"  [CypherGenerator] Generating query for: '{natural_language_query}'"
+        model_id = settings.active_cypher_model
+        provider = cast(Provider, detect_provider_from_model(model_id))
+        self.system_prompt = (
+            CYPHER_SYSTEM_PROMPT if provider != "local" else LOCAL_CYPHER_SYSTEM_PROMPT
         )
+        self.chat = _make_chat_model(model_id, provider=provider)
+
+    async def generate(self, nl_query: str) -> str:
+        logger.info(f"[CypherGenerator] NL → Cypher for: {nl_query!r}")
         try:
-            result = await self.agent.run(natural_language_query)
-            if (
-                not isinstance(result.output, str)
-                or "MATCH" not in result.output.upper()
-            ):
-                raise LLMGenerationError(
-                    f"LLM did not generate a valid query. Output: {result.output}"
-                )
-
-            query = _clean_cypher_response(result.output)
-            logger.info(f"  [CypherGenerator] Generated Cypher: {query}")
-            return query
-        except Exception as e:
-            logger.error(f"  [CypherGenerator] Error: {e}")
-            raise LLMGenerationError(f"Cypher generation failed: {e}") from e
-
-
-def create_rag_orchestrator(tools: list[Tool]) -> Agent:
-    """Factory function to create the main RAG orchestrator agent."""
-    try:
-        model_settings = None
-
-        # Get active orchestrator model and detect its provider
-        orchestrator_model_id = settings.active_orchestrator_model
-        orchestrator_provider = detect_provider_from_model(orchestrator_model_id)
-
-        if orchestrator_provider == "gemini":
-            if settings.GEMINI_PROVIDER == "vertex":
-                provider = GoogleVertexProvider(
-                    project_id=settings.GCP_PROJECT_ID,
-                    region=cast(VertexAiRegion, settings.GCP_REGION),
-                    service_account_file=settings.GCP_SERVICE_ACCOUNT_FILE,
-                )
-            else:
-                provider = GoogleGLAProvider(api_key=settings.GEMINI_API_KEY)  # type: ignore
-
-            if settings.GEMINI_THINKING_BUDGET is not None:
-                model_settings = GeminiModelSettings(
-                    gemini_thinking_config={
-                        "thinking_budget": int(settings.GEMINI_THINKING_BUDGET)
-                    }
-                )
-
-            llm = GeminiModel(
-                orchestrator_model_id,
-                provider=provider,
+            msg = await self.chat.ainvoke(
+                [
+                    SystemMessage(content=self.system_prompt),
+                    AIMessage(content=nl_query),  # LangChain treats this as “user”
+                ]
             )
-        elif orchestrator_provider == "local":
-            llm = OpenAIModel(  # type: ignore
-                orchestrator_model_id,
-                provider=OpenAIProvider(
-                    api_key=settings.LOCAL_MODEL_API_KEY,
-                    base_url=str(settings.LOCAL_MODEL_ENDPOINT),
-                ),
-            )
-        else:  # openai provider
-            llm = OpenAIResponsesModel(
-                orchestrator_model_id,
-                provider=OpenAIProvider(
-                    api_key=settings.OPENAI_API_KEY,
-                ),
-            )
+        except Exception as exc:  # network, creds, quota, …
+            raise LLMGenerationError(str(exc)) from exc
 
-        return Agent(
-            model=llm,
-            system_prompt=RAG_ORCHESTRATOR_SYSTEM_PROMPT,
-            tools=tools,
-            model_settings=model_settings,
-        )  # type: ignore
-    except Exception as e:
-        raise LLMGenerationError(f"Failed to initialize RAG Orchestrator: {e}") from e
+        text = str(msg.content)
+        if "MATCH" not in text.upper():
+            raise LLMGenerationError(
+                f"Model returned something that doesn’t look like Cypher: {text!r}"
+            )
+        cleaned = _clean_cypher_response(text)
+        logger.info(f"[CypherGenerator] ✅  {cleaned}")
+        return cleaned
+
+
+def generate_sync(nl_query: str) -> str:
+    """Blocking wrapper so call-sites don’t have to care about asyncio."""
+    return asyncio.run(CypherGenerator().generate(nl_query))
