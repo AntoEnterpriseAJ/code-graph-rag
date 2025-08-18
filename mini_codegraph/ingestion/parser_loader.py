@@ -207,6 +207,9 @@ def load_parsers() -> tuple[dict[str, Parser], dict[str, Any]]:
                     ]
                 )
 
+                if call_patterns and lang_name == "cpp":
+                    logger.debug(f"[cpp] calls pattern compiled: {call_patterns!r}")
+
                 # Combine import patterns (remove duplicates)
                 all_import_patterns = []
                 if import_patterns.strip():

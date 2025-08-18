@@ -145,12 +145,10 @@ class MemgraphIngestor:
                 )
                 continue
 
-            prop_keys = list(props_list[0].keys())
-            set_clause = ", ".join([f"n.{key} = row.{key}" for key in prop_keys])
-            query = (
-                f"MERGE (n:{label} {{{id_key}: row.{id_key}}}) "
-                f"ON CREATE SET {set_clause} ON MATCH SET {set_clause}"
-            )
+            # Upsert: apply *this row's* properties without clobbering others.
+            # This avoids the "first row decides keys" bug and preserves existing impl_* when
+            # a later row (e.g., a header decl) doesn't carry those fields.
+            query = f"MERGE (n:{label} {{{id_key}: row.{id_key}}})\nSET n += row"
             self._execute_batch(query, props_list)
         logger.info(f"Flushed {len(self.node_buffer)} nodes.")
         self.node_buffer.clear()

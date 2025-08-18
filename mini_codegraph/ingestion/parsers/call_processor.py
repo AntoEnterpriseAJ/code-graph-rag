@@ -60,7 +60,7 @@ class CallProcessor:
     def _process_calls_in_functions(
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
-        """Process calls within top-level functions."""
+        """Process calls within top-level functions (and out-of-class method definitions in C++)."""
         lang_queries = queries[language]
         lang_config: LanguageConfig = lang_queries["config"]
 
@@ -68,27 +68,36 @@ class CallProcessor:
         cursor = QueryCursor(query)
         captures = cursor.captures(root_node)
         func_nodes = captures.get("function", [])
+
         for func_node in func_nodes:
             if not isinstance(func_node, Node):
                 continue
-            if self._is_method(func_node, lang_config):
+
+            # In non-C++ languages we skip methods here and let _process_calls_in_classes handle them.
+            if language != "cpp" and self._is_method(func_node, lang_config):
                 continue
 
-            name_node = func_node.child_by_field_name("name")
-            if not name_node:
+            ident = self._extract_function_identity(
+                func_node, module_qn, language, lang_config
+            )
+            if not ident:
                 continue
-            text = name_node.text
-            if text is None:
-                continue
-            func_name = text.decode("utf8")
-            func_qn = self._build_nested_qualified_name(
-                func_node, module_qn, func_name, lang_config
+
+            caller_qn, caller_type, class_ctx = ident
+            logger.debug(
+                f"[calls] scanning {caller_type} {caller_qn} (class_ctx={class_ctx})"
             )
 
-            if func_qn:
-                self._ingest_function_calls(
-                    func_node, func_qn, "Function", module_qn, language, queries
-                )
+            # Now scan this function/method body and ingest CALLS
+            self._ingest_function_calls(
+                func_node,
+                caller_qn,
+                caller_type,
+                module_qn,
+                language,
+                queries,
+                class_ctx,  # <-- gives us same-class resolution for unqualified calls like addTransaction(...)
+            )
 
     def _process_calls_in_classes(
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
@@ -143,34 +152,128 @@ class CallProcessor:
                     class_qn,
                 )
 
-    def _get_call_target_name(self, call_node: Node) -> str | None:
-        """Extracts the name of the function or method being called."""
-        # For 'call' in Python and 'call_expression' in JS/TS
-        if func_child := call_node.child_by_field_name("function"):
-            if func_child.type == "identifier":
-                text = func_child.text
-                if text is not None:
-                    return str(text.decode("utf8"))
-            # Python: obj.method() -> attribute
-            elif func_child.type == "attribute":
-                # Return the full attribute path
-                text = func_child.text
-                if text is not None:
-                    return str(text.decode("utf8"))
-            # JS/TS: obj.method() -> member_expression
-            elif func_child.type == "member_expression":
-                # Return the full member expression (e.g., "obj.method")
-                text = func_child.text
-                if text is not None:
-                    return str(text.decode("utf8"))
+        # --- NEW: tiny helpers for C++ ---
 
-        # For 'method_invocation' in Java
+    _CPP_MEMBER_RE = re.compile(
+        r"^(?P<recv>.+?)(?:->|\.)?(?P<name>[A-Za-z_~][A-Za-z0-9_]*)$"
+    )
+
+    def _cpp_split_member(self, call_name: str) -> tuple[str | None, str] | None:
+        """
+        For 'acc.printSummary' or 'fromAcc->withdraw' return ('acc','printSummary').
+        For bare 'addTransaction' return (None,'addTransaction').
+        """
+        m = self._CPP_MEMBER_RE.match(call_name)
+        if not m:
+            return None
+        recv = m.group("recv")
+        name = m.group("name")
+        # If there's no '.' or '->', treat as bare name
+        if ("->" not in call_name) and ("." not in call_name):
+            recv = None
+        return recv, name
+
+    def _get_call_target_name(self, call_node: Node) -> Any:
+        """Extracts the name of the function or method being called."""
+        func_child = call_node.child_by_field_name("function")
+        if not func_child:
+            return None
+
+        # Normalize helper
+        def _norm(node: Node) -> Any:
+            t = node.text
+            if t is None:
+                return None
+            s = t.decode("utf8")
+            # compact spaces (tree-sitter-cpp may include spaces around '.'/'->')
+            return s.replace(" ", "")
+
+        # Common cases
+        if func_child.type in ("identifier", "attribute", "member_expression"):
+            return _norm(func_child)
+
+        # C++: obj.method / obj->method
+        if func_child.type == "field_expression":
+            return _norm(func_child)
+
+        # C++: Class::method (qualified identifier)
+        if func_child.type == "qualified_identifier":
+            return _norm(func_child)
+
+        # Java: method_invocation has 'name' field
         if name_node := call_node.child_by_field_name("name"):
-            text = name_node.text
-            if text is not None:
-                return str(text.decode("utf8"))
+            t = name_node.text
+            return t.decode("utf8") if t is not None else None
 
         return None
+
+    def _cpp_find_nameish(self, node: Node) -> Node | None:
+        """
+        DFS for a node that represents the function name:
+        'qualified_identifier' (e.g., BankAccount::withdraw),
+        'field_identifier', or 'identifier'.
+        """
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur.type in ("qualified_identifier", "field_identifier", "identifier"):
+                return cur
+            # scan children depth-first
+            stack.extend(reversed(list(cur.children)))
+        return None
+
+    def _extract_function_identity(
+        self,
+        func_node: Node,
+        module_qn: str,
+        language: str,
+        lang_config: LanguageConfig,
+    ) -> tuple[str, str, str | None] | None:
+        """
+        Return (caller_qn, caller_type, class_context) for a function definition.
+
+        - For C++ out-of-class method definitions (BankAccount::withdraw) we return:
+        ("<resolved-class-qn>.withdraw", "Method", "<resolved-class-qn>")
+        - For C++ free functions: ("<module_qn>.name", "Function", None)
+        - For other languages: ("<module_qn>.name", "Function", None)
+        """
+        # Non-C++: the simple path still works
+        if language != "cpp":
+            name_node = func_node.child_by_field_name(lang_config.name_field)
+            if not name_node or name_node.text is None:
+                return None
+            func_name = name_node.text.decode("utf8")
+            return f"{module_qn}.{func_name}", "Function", None
+
+        # --- C++ ---
+        target = func_node
+        if func_node.type == "function_definition":
+            # The function name sits under the 'declarator'
+            dec = func_node.child_by_field_name("declarator")
+            if dec:
+                target = dec
+
+        nameish = self._cpp_find_nameish(target)
+        if not nameish or nameish.text is None:
+            return None
+
+        raw = nameish.text.decode("utf8").replace(" ", "")
+        # raw might be "BankAccount::withdraw" or just "withdraw"
+        class_ctx_qn: str | None = None
+        method_or_func = raw
+
+        if "::" in raw:
+            # Scope may include namespaces; take the last scope element as the class
+            scope_parts = raw.split("::")
+            method_or_func = scope_parts[-1]
+            class_name = scope_parts[-2]  # last scope before the method
+            class_ctx_qn = self._resolve_class_name(class_name, module_qn)
+
+        if class_ctx_qn:
+            return f"{class_ctx_qn}.{method_or_func}", "Method", class_ctx_qn
+
+        # Free function in this translation unit
+        return f"{module_qn}.{method_or_func}", "Function", None
 
     def _ingest_function_calls(
         self,
@@ -185,6 +288,11 @@ class CallProcessor:
         """Find and ingest function calls within a caller node."""
         calls_query = queries[language].get("calls")
         if not calls_query:
+            cfg = queries[language]["config"]
+            logger.warning(
+                f"No 'calls' query for language={language}; "
+                f"config.call_node_types={getattr(cfg, 'call_node_types', None)}"
+            )
             return
 
         local_var_types = self.type_inference.build_local_variable_type_map(
@@ -307,6 +415,50 @@ class CallProcessor:
         class_context: str | None = None,
     ) -> tuple[str, str] | None:
         """Resolve a function call to its qualified name and type."""
+        # --- C++ and generic class-context friendly handling FIRST ---
+
+        # A) Same-class, unqualified method: e.g., inside BankAccount::deposit -> addTransaction(...)
+        if ("." not in call_name) and ("::" not in call_name) and class_context:
+            same_class_mqn = f"{class_context}.{call_name}"
+            if same_class_mqn in self.function_registry:
+                return self.function_registry[same_class_mqn], same_class_mqn
+
+        # B) C++ scoped call: Class::method(...)
+        if "::" in call_name:
+            parts = call_name.split("::")
+            if len(parts) >= 2:
+                class_name = parts[-2]
+                method_name = parts[-1]
+                class_qn = self._resolve_class_name(class_name, module_qn)
+                if class_qn:
+                    mqn = f"{class_qn}.{method_name}"
+                    if mqn in self.function_registry:
+                        return self.function_registry[mqn], mqn
+
+        # C) Member call: obj.method(...) / obj->method(...)
+        split = self._cpp_split_member(call_name)
+        if split:
+            recv, simple = split  # recv may be None for bare calls handled above
+            # If we know the variable type, use it (future C++ TI can fill this map)
+            if recv and local_var_types and recv in local_var_types:
+                var_type = local_var_types[recv]
+                class_qn = self._resolve_class_name(var_type, module_qn) or var_type
+                if class_qn:
+                    mqn = f"{class_qn}.{simple}"
+                    if mqn in self.function_registry:
+                        return self.function_registry[mqn], mqn
+
+            # Fallback: pick best matching Method by simple name
+            # Prefer candidates closer in module hierarchy
+            candidates = list(self.function_registry.find_ending_with(simple))
+            if candidates:
+                candidates.sort(
+                    key=lambda qn: self._calculate_import_distance(qn, module_qn)
+                )
+                best = candidates[0]
+                return self.function_registry[best], best
+
+        # --- existing logic (imports, same-module, trie, inheritance, chaining, etc.) ---
         # Phase 0: Handle super() calls specially
         if call_name.startswith("super()"):
             return self._resolve_super_call(call_name, module_qn, class_context)

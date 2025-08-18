@@ -33,6 +33,14 @@ Relationships (source)-[REL_TYPE]->(target):
 - **Use `STARTS WITH` for Paths**: When matching paths, always use `STARTS WITH` for robustness (e.g., `WHERE n.path STARTS WITH 'workflows/src'`). Do not use `=`.
 - **Use `toLower()` for Searches**: For case-insensitive searching on string properties, use `toLower()`.
 - **Querying Lists**: To check if a list property (like `decorators`) contains an item, use the `ANY` or `IN` clause (e.g., `WHERE 'flow' IN n.decorators`).
+
+**2.5 Robust Matching Rules (MANDATORY)**
+- `qualified_name` values are often prefixed (e.g., `Project.Package.Class.method`). Unless the user supplies the **full** exact `qualified_name`, you MUST NOT use equality on `qualified_name`. Prefer suffix matching:
+  - `WHERE toLower(n.qualified_name) ENDS WITH toLower('.Class.method')`
+  - For classes: `WHERE toLower(c.qualified_name) ENDS WITH toLower('.Class')` or use `c.name`.
+- For call graphs, ALWAYS allow both functions and methods on both sides:
+  - `(:Function|:Method)-[:CALLS]->(:Function|:Method)`
+- For case-insensitive string comparisons, ALWAYS wrap both sides with `toLower(...)`.
 """
 
 # ======================================================================================
@@ -100,6 +108,24 @@ cypher// "show me AnotherClass::doubleValue"
 MATCH (m:Method)
 WHERE m.qualified_name ENDS WITH '.AnotherClass.doubleValue'
 RETURN m.name AS name, m.qualified_name AS qualified_name, labels(m) AS type
+
+**Pattern: By class & method names (when no '::' is given)**
+cypher// "What does Bank transfer call?"
+MATCH (c:Class)-[:DEFINES_METHOD]->(m:Method)-[:CALLS]->(called:Function|Method)
+WHERE toLower(c.name) = 'bank' AND toLower(m.name) = 'transfer'
+RETURN called.name AS name, called.qualified_name AS qualified_name, labels(called) AS type
+
+**Pattern: C++-style `Class::method` outgoing calls (CANONICAL)**
+cypher// "Show me all the methods called inside Bank::transfer"
+MATCH (m:Method)-[:CALLS]->(called:Function|Method)
+WHERE toLower(m.qualified_name) ENDS WITH toLower('.Bank.transfer')
+RETURN DISTINCT called.name AS name, called.qualified_name AS qualified_name, labels(called) AS type
+
+**Pattern: Reverse call graph (who calls this method)**
+cypher// "Who calls Bank::transfer?"
+MATCH (caller:Function|Method)-[:CALLS]->(m:Method)
+WHERE toLower(m.qualified_name) ENDS WITH toLower('.Bank.transfer')
+RETURN DISTINCT caller.name AS name, caller.qualified_name AS qualified_name, labels(caller) AS type
 
 **Pattern: Finding a Specific File**
 cypher// "Find the main README.md"

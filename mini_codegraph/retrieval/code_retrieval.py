@@ -22,12 +22,10 @@ class CodeRetriever:
             MATCH (n {qualified_name:$qn})
             OPTIONAL MATCH (n)<-[:DEFINES|DEFINES_METHOD]-(m:Module)
             WITH n,
-                 coalesce(n.impl_path , m.path) AS path
-            RETURN n.name        AS name,
-                   n.start_line  AS start,
-                   n.end_line    AS end,
-                   path,
-                   n.docstring   AS docstring
+                coalesce(n.impl_path, n.decl_path, m.path) AS path,
+                coalesce(n.start_line, n.decl_start_line)  AS start,
+                coalesce(n.end_line,   n.decl_end_line)    AS end
+            RETURN n.name AS name, start, end, path, n.docstring AS docstring
             LIMIT 1
         """
         params = {"qn": qualified_name}

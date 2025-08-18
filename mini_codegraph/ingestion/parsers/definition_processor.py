@@ -211,27 +211,26 @@ class DefinitionProcessor:
         self, func_node: Node, module_qn: str, file_path: str
     ) -> bool:
         """
-        Catches C++ definitions of the form  MyClass::method(...) { … }
-        that live at file scope and registers them as Class + Method
-        instead of as a free Function.  Returns True when it handled the node.
+        Catch C++ definitions like  MyClass::method(...) { … }  at file scope
+        and register them as Class/Method (with impl_path).  Returns True if handled.
         """
-        # Ignore bare declarations like `A::foo(int);`
+        # Must have a body to be an implementation
         if not self._cpp_has_body(func_node):
             return False
-        declarator = func_node.child_by_field_name("declarator")
-        while declarator and declarator.type == "function_declarator":
-            declarator = declarator.child_by_field_name("declarator")
 
-        if not (declarator and declarator.type == "qualified_identifier"):
+        # Look inside the declarator for a qualified identifier anywhere
+        declarator = func_node.child_by_field_name("declarator") or func_node
+        qid = self._cpp_find_qualified_identifier(declarator)
+        if not qid:
             return False
 
-        scope_node = declarator.child_by_field_name("scope")
-        name_node = declarator.child_by_field_name("name")
-        if not (scope_node and name_node):
+        scope_node = qid.child_by_field_name("scope")
+        name_node = qid.child_by_field_name("name")
+        if not (scope_node and name_node and scope_node.text and name_node.text):
             return False
 
-        class_name = scope_node.text.decode("utf8")  # MyClass
-        method_name = name_node.text.decode("utf8")  # doubleValue …
+        class_name = scope_node.text.decode("utf8")
+        method_name = name_node.text.decode("utf8")
 
         class_qn = f"{module_qn}.{class_name}"
         method_qn = f"{class_qn}.{method_name}"
@@ -240,7 +239,6 @@ class DefinitionProcessor:
             "Class",
             {"qualified_name": class_qn, "name": class_name},
         )
-
         self.ingestor.ensure_node_batch(
             "Method",
             {
@@ -259,31 +257,51 @@ class DefinitionProcessor:
             "DEFINES_METHOD",
             ("Method", "qualified_name", method_qn),
         )
-
-        # ── NEW edge:   *.cpp module* → method ─────────────────────
-        #     This lets CodeRetriever pick up the correct file path.
+        # Keep this so CodeRetriever can always hop from Module → Method
         self.ingestor.ensure_relationship_batch(
-            ("Module", "qualified_name", module_qn),  # ← current .cpp file
-            "DEFINES_METHOD",  # name can stay the same
+            ("Module", "qualified_name", module_qn),
+            "DEFINES_METHOD",
             ("Method", "qualified_name", method_qn),
         )
         return True
 
     def _cpp_unwind_to_core_declarator(self, node: Node) -> Node | None:
         """
-        For C++ `function_definition` or `function_declarator`, drill down
-        through nested `function_declarator` layers until we reach the
-        core declarator (identifier | field_identifier | qualified_identifier).
+        From a C++ function_definition, strip wrappers until the *core*
+        declarator: identifier | field_identifier | qualified_identifier.
+        Handles function_declarator, pointer_declarator, reference_declarator,
+        array_declarator, and parenthesized_declarator.
         """
         cur = node
         if cur.type == "function_definition":
             cur = cur.child_by_field_name("declarator") or cur
-        while cur and cur.type == "function_declarator":
+        WRAPPERS = {
+            "function_declarator",
+            "pointer_declarator",
+            "reference_declarator",
+            "array_declarator",
+            "parenthesized_declarator",
+        }
+        # Walk down any wrapper layers to the core name node
+        while cur and cur.type in WRAPPERS:
             nxt = cur.child_by_field_name("declarator")
             if not nxt:
                 break
             cur = nxt
         return cur
+
+    def _cpp_find_qualified_identifier(self, node: Node) -> Node | None:
+        """
+        DFS to locate a 'qualified_identifier' (e.g., BankAccount::getOwner)
+        somewhere under the given node.
+        """
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur.type == "qualified_identifier":
+                return cur
+            stack.extend(reversed(list(cur.children)))
+        return None
 
     def _cpp_extract_name(self, node: Node) -> Any:
         """
@@ -334,19 +352,24 @@ class DefinitionProcessor:
             # add the Function node and skip the generic code below.
             # ────────────────────────────────────────────────────────────────
             if language == "cpp":
-                if not self._cpp_has_body(func_node):  # ← skip declarations
+                # Only real definitions (with bodies)
+                if not self._cpp_has_body(func_node):
                     continue
-                simple = self._cpp_extract_name(func_node)
-                if not simple:
-                    continue
-                # out-of-class definitions like  A::foo(...) { … }
+
+                # 1) FIRST: try to treat it as an out-of-class method like A::foo(...)
                 if self._handle_cpp_out_of_class_method(
                     func_node, module_qn, file_path
                 ):
                     continue
-                # inline class methods are handled inside
-                # _ingest_classes_and_methods()
+
+                # 2) If it's an *inline* method inside a class, let the class pass handle it
                 if self._is_method(func_node, lang_config):
+                    continue
+
+                # 3) Otherwise it's a free function in this TU
+                simple = self._cpp_extract_name(func_node)
+                if not simple:
+                    # Can't determine a name; skip quietly
                     continue
 
                 func_qn = f"{module_qn}.{simple}"
@@ -368,7 +391,7 @@ class DefinitionProcessor:
                     "DEFINES",
                     ("Function", "qualified_name", func_qn),
                 )
-                continue  # ✅  handled – move to next node
+                continue
 
             if not isinstance(func_node, Node):
                 logger.warning(
@@ -572,9 +595,13 @@ class DefinitionProcessor:
             method_cursor = QueryCursor(method_query)
             method_captures = method_cursor.captures(body_node)
             method_nodes = method_captures.get("function", [])
+
             for method_node in method_nodes:
-                if language == "cpp" and not self._cpp_has_body(method_node):
-                    continue
+                # For C++, *do not* skip methods without bodies. We still want a symbol for
+                # declarations like `std::string getOwner() const;` so calls can resolve.
+                has_body = True
+                if language == "cpp":
+                    has_body = self._cpp_has_body(method_node)
 
                 method_name = None
                 method_name_node = method_node.child_by_field_name("name")
@@ -593,11 +620,28 @@ class DefinitionProcessor:
                     "qualified_name": method_qn,
                     "name": method_name,
                     "decorators": decorators,
-                    "impl_path": file_path,
-                    "start_line": method_node.start_point[0] + 1,
-                    "end_line": method_node.end_point[0] + 1,
                     "docstring": self._get_docstring(method_node),
                 }
+
+                if has_body:
+                    # Real implementation: record impl file + span
+                    method_props.update(
+                        {
+                            "impl_path": file_path,
+                            "start_line": method_node.start_point[0] + 1,
+                            "end_line": method_node.end_point[0] + 1,
+                        }
+                    )
+                else:
+                    # Header-only declaration: record *declaration* location, but DO NOT touch impl span
+                    method_props.update(
+                        {
+                            "decl_path": file_path,
+                            "decl_start_line": method_node.start_point[0] + 1,
+                            "decl_end_line": method_node.end_point[0] + 1,
+                        }
+                    )
+
                 logger.info(f"    Found Method: {method_name} (qn: {method_qn})")
                 self.ingestor.ensure_node_batch("Method", method_props)
 
@@ -606,6 +650,12 @@ class DefinitionProcessor:
 
                 self.ingestor.ensure_relationship_batch(
                     ("Class", "qualified_name", class_qn),
+                    "DEFINES_METHOD",
+                    ("Method", "qualified_name", method_qn),
+                )
+
+                self.ingestor.ensure_relationship_batch(
+                    ("Module", "qualified_name", module_qn),
                     "DEFINES_METHOD",
                     ("Method", "qualified_name", method_qn),
                 )
