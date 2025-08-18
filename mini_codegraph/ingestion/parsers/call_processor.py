@@ -263,13 +263,12 @@ class CallProcessor:
         method_or_func = raw
 
         if "::" in raw:
-            # Scope may include namespaces; take the last scope element as the class
+            # Scope may include namespaces; take the last scope element as the class.
             scope_parts = raw.split("::")
             method_or_func = scope_parts[-1]
-            class_name = scope_parts[-2]  # last scope before the method
-            class_ctx_qn = self._resolve_class_name(class_name, module_qn)
-
-        if class_ctx_qn:
+            class_name = scope_parts[-2]
+            # Canonicalize to THIS translation unit to avoid header vs src splits.
+            class_ctx_qn = f"{module_qn}.{class_name}"
             return f"{class_ctx_qn}.{method_or_func}", "Method", class_ctx_qn
 
         # Free function in this translation unit
@@ -429,7 +428,10 @@ class CallProcessor:
             if len(parts) >= 2:
                 class_name = parts[-2]
                 method_name = parts[-1]
-                class_qn = self._resolve_class_name(class_name, module_qn)
+                # Prefer the class in THIS translation unit
+                class_qn = f"{module_qn}.{class_name}"
+                if class_qn not in self.function_registry:
+                    class_qn = self._resolve_class_name(class_name, module_qn)
                 if class_qn:
                     mqn = f"{class_qn}.{method_name}"
                     if mqn in self.function_registry:
@@ -799,6 +801,10 @@ class CallProcessor:
         # Bonus for candidates that are "close" in the module hierarchy
         if candidate_qn.startswith(".".join(caller_parts[:-1]) + "."):
             base_distance -= 1
+
+        # Penalize header-style modules so impls win ties (e.g., ".include.")
+        if ".include." in candidate_qn:
+            base_distance += 1
 
         return base_distance
 
